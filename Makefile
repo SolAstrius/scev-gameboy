@@ -13,6 +13,7 @@
 
 HAL      := vendor/rvvm-hal
 BINJGB   := vendor/binjgb
+PICOLIBC := $(HAL)/vendor/picolibc-build/min/install
 TARGET   := riscv64-freestanding-none
 CC       := zig cc -target $(TARGET)
 OBJCOPY  := llvm-objcopy
@@ -20,19 +21,23 @@ OBJCOPY  := llvm-objcopy
 RVVM     ?= $(shell command -v rvvm 2>/dev/null || \
                     echo /home/sol/repos/RVVM/release.linux.x86_64/rvvm_x86_64)
 
-# Include order: src/ first (for our shims overriding nothing yet),
-# then HAL headers, then binjgb headers (binjgb does `#include
-# "common.h"` so we need the binjgb dir on the path; we put it under
-# `binjgb/` in the include path so the user code says
-# `#include "binjgb/emulator.h"` — keeps namespacing tidy and avoids
-# clashes with HAL's `common.h`-shaped names).
+# Include order: picolibc first (so <stdio.h>, <string.h>, <assert.h>
+# resolve to the vendored libc; HAL_PICOLIBC=min is the slim variant —
+# integer printf, no float, no posix-io). Then src/, HAL, vendor/.
+# binjgb_shim.c keeps its bump allocator, overriding picolibc's
+# malloc/free at link time.
 CFLAGS   := -Os -ffreestanding -fno-stack-protector -fno-pie \
             -mcmodel=medany -nostdlib \
             -Wall -Wextra -Wno-unused-parameter -Wno-unused-but-set-variable \
             -Wno-unused-function -Wno-unused-variable \
-            -Isrc/stub-libc -Isrc -I$(HAL)/include -Ivendor
+            -DHAL_PICOLIBC \
+            -isystem $(PICOLIBC)/include \
+            -Isrc -I$(HAL)/include -Ivendor
 
-LDFLAGS  := -nostdlib -static -Wl,-T,$(HAL)/link.ld
+# --gc-sections trims unreferenced picolibc objects per-firmware so
+# we only pay for symbols binjgb actually calls (printf + a handful
+# of mem*/str* + assert).
+LDFLAGS  := -nostdlib -static -Wl,-T,$(HAL)/link.ld -Wl,--gc-sections
 
 # Speccy-style: our glue + shim + binjgb's emulator.c.
 # We deliberately do NOT compile vendor/binjgb/common.c or memory.c —
@@ -53,11 +58,14 @@ build/emulator.o: $(BINJGB)/emulator.c
 	@mkdir -p build
 	$(CC) $(CFLAGS) -I$(BINJGB) -c -o $@ $<
 
-$(HAL)/libhal.a:
-	$(MAKE) -C $(HAL)
+$(PICOLIBC)/lib/libc.a:
+	$(MAKE) -C $(HAL) picolibc-min
 
-firmware.elf: $(OBJS) $(HAL)/libhal.a
-	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(HAL)/libhal.a
+$(HAL)/libhal.a: $(PICOLIBC)/lib/libc.a
+	$(MAKE) -C $(HAL) HAL_PICOLIBC=min
+
+firmware.elf: $(OBJS) $(HAL)/libhal.a $(PICOLIBC)/lib/libc.a
+	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(HAL)/libhal.a $(PICOLIBC)/lib/libc.a
 
 firmware.bin: firmware.elf
 	$(OBJCOPY) -O binary $< $@
