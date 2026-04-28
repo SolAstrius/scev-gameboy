@@ -295,39 +295,92 @@ void kmain(uint64_t hartid, uint64_t fdt_addr) {
     const uint64_t ticks_per_frame = RVVM_TIME_HZ * 10 / 597;
     uint64_t deadline = time_now() + ticks_per_frame;
 
+    /* Profiling. Accumulate per-phase ticks (RVVM_TIME_HZ = 10 MHz,
+     * so 1 tick = 100 ns) and call counts; dump every 60 frames =
+     * once per second of wall-clock at the GB's 59.7 Hz target.
+     *
+     * The dump tells us where the budget goes. If `wfi_pace` is
+     * close to ticks_per_frame we have headroom; if it's near zero
+     * we're at the limit and overshooting. If `run` dominates,
+     * binjgb's interpreter is the bottleneck (RVVM JIT warmup /
+     * DGB CPU complexity); if `blit` dominates, the framebuffer
+     * path needs work. */
+    uint64_t prof_run = 0, prof_blit = 0, prof_audio = 0,
+             prof_hid = 0, prof_pace = 0;
+    uint32_t prof_frames = 0, prof_run_calls = 0,
+             prof_audio_drops = 0;
+    uint64_t prof_window_start = time_now();
+
     for (;;) {
+        uint64_t t0 = time_now();
         hid_kb_poll(&kb, on_key, NULL);
         emulator_set_joypad_buttons(emu, &joyp);
+        uint64_t t1 = time_now();
+        prof_hid += t1 - t0;
 
         /* Drive the emulator until the PPU finishes a frame. binjgb
          * may return EMULATOR_EVENT_AUDIO_BUFFER_FULL mid-frame when
          * audio_frames worth of samples have been generated — drain
-         * those into the host PCM ring and keep going. Without this
-         * loop the PPU would stall on a full audio buffer and the
-         * blit below would paint the previous frame, halving the
-         * effective frame rate. */
+         * those into the host PCM ring and keep going. */
         Ticks target = emulator_get_ticks(emu) + PPU_FRAME_TICKS;
         EmulatorEvent ev = 0;
         for (int safety = 0; safety < 16; safety++) {
             ev = emulator_run_until(emu, target);
+            prof_run_calls++;
             if (have_audio && (ev & EMULATOR_EVENT_AUDIO_BUFFER_FULL)) {
+                uint64_t a0 = time_now();
                 push_audio(emulator_get_audio_buffer(emu));
+                prof_audio += time_now() - a0;
             }
             if (ev & EMULATOR_EVENT_NEW_FRAME) break;
-            if (ev == 0) break;          /* hit target_ticks without frame */
+            if (ev == 0) break;
         }
+        uint64_t t2 = time_now();
+        prof_run += t2 - t1;
 
         if (have_gfx && (ev & EMULATOR_EVENT_NEW_FRAME)) {
             FrameBuffer *fb = emulator_get_frame_buffer(emu);
             blit_frame((const RGBA *)*fb, x_off, y_off);
         }
+        uint64_t t3 = time_now();
+        prof_blit += t3 - t2;
 
-        /* Drain whatever audio binjgb has accumulated since the last
-         * AUDIO_BUFFER_FULL drain. Catches the trailing partial buffer
-         * for the frame's tail. */
-        if (have_audio) push_audio(emulator_get_audio_buffer(emu));
+        if (have_audio) {
+            AudioBuffer *ab = emulator_get_audio_buffer(emu);
+            uint32_t buffered = (uint32_t)(ab->position - ab->data) / 2;
+            if (buffered && audio_pcm_writable(&pcm) < buffered)
+                prof_audio_drops++;
+            push_audio(ab);
+        }
+        uint64_t t4 = time_now();
+        prof_audio += t4 - t3;
 
         time_busy_until(deadline);
+        uint64_t t5 = time_now();
+        prof_pace += t5 - t4;
         deadline += ticks_per_frame;
+
+        if (++prof_frames >= 60) {
+            uint64_t window = t5 - prof_window_start;
+            /* Convert ticks → microseconds (10 MHz → ÷10). All
+             * formats use uart_printf's %u (uint64_t), so we cast. */
+            #define US(t) ((uint64_t)((t) / 10))
+            uart_printf("[prof] %u frames in %u ms — "
+                        "run=%uus blit=%uus audio=%uus hid=%uus pace=%uus "
+                        "(run-calls=%u, audio-drops=%u)\n",
+                        (uint64_t)prof_frames,
+                        US(window) / 1000,
+                        US(prof_run)   / prof_frames,
+                        US(prof_blit)  / prof_frames,
+                        US(prof_audio) / prof_frames,
+                        US(prof_hid)   / prof_frames,
+                        US(prof_pace)  / prof_frames,
+                        (uint64_t)prof_run_calls,
+                        (uint64_t)prof_audio_drops);
+            #undef US
+            prof_run = prof_blit = prof_audio = prof_hid = prof_pace = 0;
+            prof_frames = prof_run_calls = prof_audio_drops = 0;
+            prof_window_start = t5;
+        }
     }
 }
