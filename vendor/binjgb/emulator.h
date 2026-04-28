@@ -244,6 +244,14 @@ EmulatorEvent emulator_run_until(Emulator*, Ticks until_ticks);
 ApuLog* emulator_get_apu_log(Emulator*);
 void emulator_reset_apu_log(Emulator*);
 
+/* Debug accessors for the GB CPU's program counter and currently
+ * mapped ROM bank in the upper 0x4000-0x7FFF window. Together they
+ * uniquely identify a code byte in the cart. Useful for correlating
+ * audio (or other) artefacts with the CPU's location at the moment
+ * of observation. Both cheap field reads — safe to call every frame. */
+u16 emulator_get_pc(Emulator*);
+u16 emulator_get_rom1_bank(Emulator*);
+
 #ifdef __cplusplus
 }
 #endif

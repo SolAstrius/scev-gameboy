@@ -4891,6 +4891,19 @@ u32 emulator_get_ppu_frame(Emulator* e) {
   return PPU.frame;
 }
 
+u16 emulator_get_pc(Emulator* e) {
+  return REG.PC;
+}
+
+u16 emulator_get_rom1_bank(Emulator* e) {
+  /* MMAP_STATE.rom_base[1] is the absolute byte offset into the
+   * cart's ROM image of whatever is currently mapped at $4000-$7FFF.
+   * Divide by ROM bank size (16 KiB) to get the bank number the
+   * MBC has selected. rom_base[0] for the $0000-$3FFF window is
+   * usually 0 (or low banks for MBC1 mode 1 / MBC5). */
+  return (u16)(MMAP_STATE.rom_base[1] >> ROM_BANK_SHIFT);
+}
+
 u32 audio_buffer_get_frames(AudioBuffer* audio_buffer) {
   return (audio_buffer->position - audio_buffer->data) / SOUND_OUTPUT_COUNT;
 }

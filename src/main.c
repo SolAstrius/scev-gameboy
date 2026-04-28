@@ -278,10 +278,57 @@ static void blit_frame(const RGBA *fb, uint32_t x_off, uint32_t y_off) {
     }
 }
 
-/* Convert binjgb's u8 stereo audio to s16 stereo and push into the
- * PCM ring. binjgb's AudioBuffer.data is u8 0..255 with 128 = silence;
- * shift to s16 by ((sample - 128) << 8). */
-static void push_audio(AudioBuffer *ab) {
+/* Single-pole HPF state, separate per channel. binjgb's audio output
+ * is unsigned 0..240 with 0 = silence (analogue of the GB DAC's 0 V
+ * idle level), NOT the usual u8 PCM convention of 128 = silence. So
+ * a naive `(s - 128) << 8` produces a hefty negative DC offset that
+ * jumps every time a channel powers on / off — audible as the
+ * deterministic "title-screen click" plus harsh / clipped sound at
+ * loud passages where the bias-shifted signal pushes against the s16
+ * rails. Real DMG / CGB hardware fixes this with an analogue
+ * AC-coupling capacitor; we do the same in software here.
+ *
+ * y[n] = x[n] - x[n-1] + α·y[n-1]  with α≈0.997 → fc≈20 Hz at 44.1kHz.
+ * Q16 fixed-point so we don't pull in soft-float on a freestanding
+ * RV target. State persists across push_audio calls (and across
+ * silence-padded drops — feeding zeros lets the filter decay
+ * naturally instead of snapping). */
+#define HPF_ALPHA_Q16   65349    /* round(0.99715 * 65536) */
+static int32_t hpf_l_x_prev = 0, hpf_l_y_prev = 0;
+static int32_t hpf_r_x_prev = 0, hpf_r_y_prev = 0;
+
+/* Audio-path window metrics — reset by the prof dump every 60 frames.
+ * u8_min/max: extremes of binjgb's output samples seen this window
+ *   (binjgb output range is 0..240; if max ever hits 240 hard, the
+ *    GB's APU is at full crank and the HPF may clip).
+ * hpf_clips: count of HPF output samples clamped to s16 rails. Any
+ *   non-zero value indicates clipping → audible distortion.
+ * inflight_min/max: peak ring fullness extremes. inflight_max near
+ *   ring_frames-1 = chronically full (host slow / firmware ahead);
+ *   inflight_min near 0 = chronically empty (firmware slow / drops).
+ * push_calls: how many times push_audio actually wrote a non-empty
+ *   batch (sanity vs run_calls). */
+static uint32_t audio_u8_min = 255, audio_u8_max = 0;
+static uint32_t audio_hpf_clips = 0;
+static uint32_t audio_inflight_min = 0xFFFFFFFFu;
+static uint32_t audio_inflight_max = 0;
+static uint32_t audio_push_calls = 0;
+
+static inline int16_t hpf_step(int32_t x, int32_t *x_prev, int32_t *y_prev) {
+    int32_t y = x - *x_prev
+              + (int32_t)(((int64_t)*y_prev * HPF_ALPHA_Q16) >> 16);
+    *x_prev = x;
+    *y_prev = y;
+    if (y >  32767) { y =  32767; audio_hpf_clips++; }
+    if (y < -32768) { y = -32768; audio_hpf_clips++; }
+    return (int16_t)y;
+}
+
+/* Convert binjgb's u8 stereo audio to s16 stereo, AC-couple, and push
+ * into the PCM ring. Returns true on a drop (caller counts for
+ * diagnostics). See HPF_ALPHA_Q16 above for the silence-convention
+ * rationale. */
+static bool push_audio(AudioBuffer *ab) {
     uint32_t frames = (uint32_t)(ab->position - ab->data) / 2;
     /* Reset the position cursor BEFORE early-out paths — binjgb's
      * audio_buffer_full event fires when position reaches end, and
@@ -289,37 +336,64 @@ static void push_audio(AudioBuffer *ab) {
      * waiting for the consumer (us). Always claim we drained, even
      * if the host PCM ring couldn't actually fit it. */
     ab->position = ab->data;
-    if (frames == 0) return;
+    if (frames == 0) return false;
 
-    /* Wait briefly for ring room when the host is transiently behind,
-     * rather than dropping the batch. Dropping leaves the ring slots
-     * holding stale audio from a previous wrap — when LPIB later
-     * sweeps through them, the host replays that stale snippet, audible
-     * as a click. Linux's ALSA writei is blocking on the guest side and
-     * dodges this by stalling the producer; we mirror that here.
-     *
-     * 1 ms polling chunks for up to 5 ms (well under one PPU frame =
-     * 16.7 ms, so even the worst-case wait keeps us inside the frame's
-     * pacing budget). If the host is genuinely stalled longer than
-     * that — PipeWire stuck, ALSA wedged — give up and drop; emulator
-     * pacing matters more than fidelity at that point. */
+    /* Wait briefly for ring room when the host is transiently behind.
+     * Linux's ALSA writei on the guest side is blocking and gets this
+     * for free; we have to do it explicitly. 1 ms polling chunks for
+     * up to 5 ms — well under one PPU frame (16.7 ms) so even the
+     * worst-case wait keeps us inside the frame's pacing budget. */
     uint32_t writable = audio_pcm_writable(&pcm);
     int      waited   = 0;
     while (writable < frames) {
-        if (waited++ >= 5) return;
+        if (waited++ >= 5) break;
         time_busy_until(time_now() + RVVM_TIME_HZ / 1000);
         writable = audio_pcm_writable(&pcm);
     }
 
-    uint32_t wp = pcm.wp_frames;
-    for (uint32_t i = 0; i < frames; i++) {
+    uint32_t wp       = pcm.wp_frames;
+    bool     dropped  = (writable < frames);
+    /* Drop path: write silence into whatever slots ARE available and
+     * advance wp by exactly that amount. Why silence-pad rather than
+     * just `return`: leaving the slots untouched means the host
+     * replays whatever was there from the previous ring wrap when
+     * LPIB sweeps through — an audibly distinct stale-snippet click.
+     * Silence-padding turns it into a brief gap. The (frames -
+     * writable) of fresh GB audio that didn't fit is lost; binjgb's
+     * clock keeps moving regardless because we already reset
+     * ab->position above. */
+    uint32_t to_write = dropped ? writable : frames;
+    /* Inflight window-min/max sampled per push (post-this-write count).
+     * Min near 0 = firmware lagging / host racing ahead;
+     * max near N-1 = host stuck / firmware racing ahead. */
+    uint32_t inflight = (pcm.wp_frames + to_write + PCM_RING_FRAMES
+                         - audio_pcm_position(&pcm)) % PCM_RING_FRAMES;
+    if (inflight > audio_inflight_max) audio_inflight_max = inflight;
+    if (inflight < audio_inflight_min) audio_inflight_min = inflight;
+
+    for (uint32_t i = 0; i < to_write; i++) {
         uint32_t idx = ((wp + i) % PCM_RING_FRAMES) * PCM_CHANNELS;
-        int16_t l = (int16_t)(((int32_t)ab->data[i * 2 + 0] - 128) << 8);
-        int16_t r = (int16_t)(((int32_t)ab->data[i * 2 + 1] - 128) << 8);
-        pcm_ring[idx + 0] = l;
-        pcm_ring[idx + 1] = r;
+        /* Pre-HPF input: binjgb u8 (silence=0). Run through the HPF
+         * regardless of dropped — feeding zeros during a drop lets
+         * the filter decay smoothly instead of leaving a
+         * pre-drop-state x_prev that would produce a step on the
+         * next real audio frame. */
+        int32_t x_l = dropped ? 0 : (int32_t)ab->data[i * 2 + 0] << 7;
+        int32_t x_r = dropped ? 0 : (int32_t)ab->data[i * 2 + 1] << 7;
+        if (!dropped) {
+            uint32_t lu = ab->data[i * 2 + 0];
+            uint32_t ru = ab->data[i * 2 + 1];
+            if (lu < audio_u8_min) audio_u8_min = lu;
+            if (lu > audio_u8_max) audio_u8_max = lu;
+            if (ru < audio_u8_min) audio_u8_min = ru;
+            if (ru > audio_u8_max) audio_u8_max = ru;
+        }
+        pcm_ring[idx + 0] = hpf_step(x_l, &hpf_l_x_prev, &hpf_l_y_prev);
+        pcm_ring[idx + 1] = hpf_step(x_r, &hpf_r_x_prev, &hpf_r_y_prev);
     }
-    audio_pcm_advance(&pcm, frames);
+    audio_pcm_advance(&pcm, to_write);
+    audio_push_calls++;
+    return dropped;
 }
 
 void kmain(uint64_t hartid, uint64_t fdt_addr) {
@@ -470,7 +544,7 @@ void kmain(uint64_t hartid, uint64_t fdt_addr) {
             prof_run_calls++;
             if (have_audio && (step_ev & EMULATOR_EVENT_AUDIO_BUFFER_FULL)) {
                 uint64_t a0 = time_now();
-                push_audio(emulator_get_audio_buffer(emu));
+                if (push_audio(emulator_get_audio_buffer(emu))) prof_audio_drops++;
                 prof_audio += time_now() - a0;
             }
         }
@@ -489,11 +563,7 @@ void kmain(uint64_t hartid, uint64_t fdt_addr) {
         prof_blit += t3 - t2;
 
         if (have_audio) {
-            AudioBuffer *ab = emulator_get_audio_buffer(emu);
-            uint32_t buffered = (uint32_t)(ab->position - ab->data) / 2;
-            if (buffered && audio_pcm_writable(&pcm) < buffered)
-                prof_audio_drops++;
-            push_audio(ab);
+            if (push_audio(emulator_get_audio_buffer(emu))) prof_audio_drops++;
         }
         uint64_t t4 = time_now();
         prof_audio += t4 - t3;
@@ -513,10 +583,24 @@ void kmain(uint64_t hartid, uint64_t fdt_addr) {
             uint64_t eff_hz_x10 = (uint64_t)ppu_dt * 10000ULL
                                 / ((uint64_t)window / 10000ULL);
             #define US(t) ((uint64_t)((t) / 10))
+            /* Snapshot CPU state at window-end. PC alone identifies a
+             * fixed-bank address; PC + bank uniquely points into the
+             * cart's ROM image when PC ∈ $4000..$7FFF. For PC ∈
+             * $0000..$3FFF the visible bank is the rom0 mapping
+             * (usually 0); we still print rom1's bank so you can see
+             * which area the game has paged in regardless. */
+            uint16_t cpu_pc   = emulator_get_pc(emu);
+            uint16_t rom_bank = emulator_get_rom1_bank(emu);
+            /* uart_printf supports %u %d %x %s %c %p %% only — NO
+             * width specifiers. %04x silently turns into "?4x" and
+             * eats no va_arg, shifting every subsequent field. So
+             * use plain %x and pad mentally when reading. */
             uart_printf("[prof] iters=%u ppu_frames=%u "
                         "wall=%ums eff=%u.%uHz | "
                         "run=%uus blit=%uus audio=%uus hid=%uus pace=%uus "
-                        "(run-calls=%u, drops=%u)\n",
+                        "| pc=%x bank=%u "    /* %x already prints "0x" */
+                        "u8=[%u..%u] hpf_clip=%u inflight=[%u..%u] "
+                        "(run-calls=%u, push=%u, drops=%u)\n",
                         (uint64_t)prof_iters,
                         (uint64_t)ppu_dt,
                         US(window) / 1000,
@@ -526,13 +610,24 @@ void kmain(uint64_t hartid, uint64_t fdt_addr) {
                         US(prof_audio) / prof_iters,
                         US(prof_hid)   / prof_iters,
                         US(prof_pace)  / prof_iters,
+                        (uint64_t)cpu_pc, (uint64_t)rom_bank,
+                        (uint64_t)audio_u8_min, (uint64_t)audio_u8_max,
+                        (uint64_t)audio_hpf_clips,
+                        (uint64_t)audio_inflight_min,
+                        (uint64_t)audio_inflight_max,
                         (uint64_t)prof_run_calls,
+                        (uint64_t)audio_push_calls,
                         (uint64_t)prof_audio_drops);
             #undef US
             prof_run = prof_blit = prof_audio = prof_hid = prof_pace = 0;
             prof_iters = prof_run_calls = prof_audio_drops = 0;
             prof_ppu_frame_base = ppu_now;
             prof_window_start   = t5;
+            audio_u8_min = 255; audio_u8_max = 0;
+            audio_hpf_clips = 0;
+            audio_inflight_min = 0xFFFFFFFFu;
+            audio_inflight_max = 0;
+            audio_push_calls = 0;
         }
     }
 }
