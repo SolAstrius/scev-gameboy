@@ -326,16 +326,21 @@ void kmain(uint64_t hartid, uint64_t fdt_addr) {
          * worth of ticks. Each call to run_until may return early on
          * AUDIO_BUFFER_FULL (drain) or UNTIL_TICKS (deadline reached);
          * we re-target each call from the CURRENT tick counter so
-         * we always make forward progress, even when LCD is off and
-         * NEW_FRAME never fires. Loop terminates when TICKS has
-         * advanced by PPU_FRAME_TICKS. */
+         * we always make forward progress.
+         *
+         * IMPORTANT: events must accumulate across calls. NEW_FRAME
+         * typically fires in the call that hits PPU vblank (early
+         * in the iteration); the FINAL call usually returns just
+         * UNTIL_TICKS. If we only kept the last `ev`, we'd miss
+         * NEW_FRAME and never blit. */
         Ticks initial_ticks = emulator_get_ticks(emu);
         Ticks target        = initial_ticks + PPU_FRAME_TICKS;
         EmulatorEvent ev    = 0;
         while (emulator_get_ticks(emu) < target) {
-            ev = emulator_run_until(emu, target);
+            EmulatorEvent step_ev = emulator_run_until(emu, target);
+            ev |= step_ev;
             prof_run_calls++;
-            if (have_audio && (ev & EMULATOR_EVENT_AUDIO_BUFFER_FULL)) {
+            if (have_audio && (step_ev & EMULATOR_EVENT_AUDIO_BUFFER_FULL)) {
                 uint64_t a0 = time_now();
                 push_audio(emulator_get_audio_buffer(emu));
                 prof_audio += time_now() - a0;
