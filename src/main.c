@@ -49,12 +49,14 @@ void *memcpy(void *, const void *, unsigned long);
  * never under-fill: 768 = 2^8 * 3. Stereo, u8 samples → 1536 bytes. */
 #define AUDIO_FRAMES   768u
 
-/* On-host PCM ring fed from the APU's per-frame buffer. 4800 frames
- * stereo s16 ≈ 19 KB; 100 ms at 48 kHz of slack — plenty. We'll
- * resample u8→s16 at copy-out time. */
-#define PCM_RING_FRAMES   4800u
+/* On-host PCM ring fed from the APU's per-frame buffer. Match
+ * binjgb's native sample rate (44100) so we don't pitch-shift +9 %
+ * by replaying 44.1 kHz samples through a 48 kHz PCM channel. RVVM's
+ * HDA accepts 44100 directly. 4410 frames = 100 ms ring at 44.1 kHz;
+ * round to a multiple of 5 (the BDL entry count) → 4400. */
+#define PCM_RING_FRAMES   4400u
 #define PCM_BDL_ENTRIES   5u
-#define PCM_SAMPLE_RATE   48000u
+#define PCM_SAMPLE_RATE   44100u
 
 __attribute__((aligned(128)))
 static int16_t pcm_ring[PCM_RING_FRAMES * 2];   /* stereo */
@@ -133,19 +135,36 @@ static uint32_t load_cart_from_nvme(void) {
     return (uint32_t)disk_bytes;
 }
 
-/* Convert binjgb's 160×144 RGBA framebuffer to the gfx surface,
- * scaled ×GB_SCALE, centred on the surface. RGBA in binjgb is
- * little-endian ARGB, which is exactly XRGB8888 + alpha=0xFF — gfx
- * will mask alpha off (XBGR backends are auto-swizzled by gfx_pixel). */
+/* Direct-to-vram blit, ×4 nearest-neighbour. Bypasses gfx_pixel's
+ * per-call format check by hoisting it once at the top, hoists the
+ * 4 destination row pointers once per source scanline, and unrolls
+ * the 4×4 source-pixel block into 16 explicit stores. ~4× faster
+ * than the per-call helper for our visible 92,160-pixel surface. */
 static void blit_frame(const RGBA *fb, uint32_t x_off, uint32_t y_off) {
+    uint32_t *vram   = g.vram;
+    uint32_t  stride = g.stride_px;
+    bool      bgr    = (g.format == GFX_FMT_XBGR8888);
+
     for (uint32_t y = 0; y < GB_H; y++) {
+        uint32_t  base = (y_off + y * GB_SCALE) * stride + x_off;
+        uint32_t *r0   = &vram[base];
+        uint32_t *r1   = &vram[base + stride];
+        uint32_t *r2   = &vram[base + 2 * stride];
+        uint32_t *r3   = &vram[base + 3 * stride];
+        const RGBA *src = &fb[y * GB_W];
+
         for (uint32_t x = 0; x < GB_W; x++) {
-            uint32_t color = (uint32_t)fb[y * GB_W + x] & 0x00FFFFFFu;
-            uint32_t px = x_off + x * GB_SCALE;
-            uint32_t py = y_off + y * GB_SCALE;
-            for (uint32_t dy = 0; dy < GB_SCALE; dy++)
-                for (uint32_t dx = 0; dx < GB_SCALE; dx++)
-                    gfx_pixel(&g, px + dx, py + dy, color);
+            uint32_t c = (uint32_t)src[x] & 0x00FFFFFFu;
+            if (bgr) {
+                uint32_t r = (c >> 16) & 0xFF;
+                uint32_t b = (c >>  0) & 0xFF;
+                c = (c & 0xFF00FF00U) | (b << 16) | r;
+            }
+            uint32_t dx = x * GB_SCALE;
+            r0[dx] = r0[dx+1] = r0[dx+2] = r0[dx+3] = c;
+            r1[dx] = r1[dx+1] = r1[dx+2] = r1[dx+3] = c;
+            r2[dx] = r2[dx+1] = r2[dx+2] = r2[dx+3] = c;
+            r3[dx] = r3[dx+1] = r3[dx+2] = r3[dx+3] = c;
         }
     }
 }
@@ -155,28 +174,32 @@ static void blit_frame(const RGBA *fb, uint32_t x_off, uint32_t y_off) {
  * shift to s16 by ((sample - 128) << 8). */
 static void push_audio(AudioBuffer *ab) {
     uint32_t frames = (uint32_t)(ab->position - ab->data) / 2;
+    /* Reset the position cursor BEFORE early-out paths — binjgb's
+     * audio_buffer_full event fires when position reaches end, and
+     * if we leave position at end the PPU stalls indefinitely
+     * waiting for the consumer (us). Always claim we drained, even
+     * if the host PCM ring couldn't actually fit it. */
+    ab->position = ab->data;
     if (frames == 0) return;
 
     uint32_t writable = audio_pcm_writable(&pcm);
     if (writable < frames) {
-        /* Drop oldest by skipping ahead — better than stalling the
-         * frame loop. Audio glitches but the emulator stays paced. */
+        /* Host hasn't drained fast enough — drop this batch. Audio
+         * glitches but emulation stays paced. Common when the GB
+         * frame rate (59.7 Hz) is faster than wall-clock pacing
+         * during JIT warmup. */
         return;
     }
 
     uint32_t wp = pcm.wp_frames;
     for (uint32_t i = 0; i < frames; i++) {
         uint32_t idx = ((wp + i) % PCM_RING_FRAMES) * 2;
-        int16_t l = (int16_t)((int32_t)ab->data[i * 2 + 0] - 128) << 8;
-        int16_t r = (int16_t)((int32_t)ab->data[i * 2 + 1] - 128) << 8;
+        int16_t l = (int16_t)(((int32_t)ab->data[i * 2 + 0] - 128) << 8);
+        int16_t r = (int16_t)(((int32_t)ab->data[i * 2 + 1] - 128) << 8);
         pcm_ring[idx + 0] = l;
         pcm_ring[idx + 1] = r;
     }
     audio_pcm_advance(&pcm, frames);
-
-    /* Reset the position cursor — binjgb refills the buffer on the
-     * next emulator_run call, starting from data again. */
-    ab->position = ab->data;
 }
 
 void kmain(uint64_t hartid, uint64_t fdt_addr) {
@@ -276,22 +299,33 @@ void kmain(uint64_t hartid, uint64_t fdt_addr) {
         hid_kb_poll(&kb, on_key, NULL);
         emulator_set_joypad_buttons(emu, &joyp);
 
-        /* Run until the PPU completes one frame. binjgb returns the
-         * event mask: EMULATOR_EVENT_NEW_FRAME and/or
-         * EMULATOR_EVENT_AUDIO_BUFFER_FULL. We don't need to inspect —
-         * advancing by PPU_FRAME_TICKS is exactly what we want. */
-        Ticks now = (Ticks)0;       /* placeholder, see TODO below */
-        (void)now;
-        emulator_run_until(emu, emulator_get_ticks(emu) + PPU_FRAME_TICKS);
+        /* Drive the emulator until the PPU finishes a frame. binjgb
+         * may return EMULATOR_EVENT_AUDIO_BUFFER_FULL mid-frame when
+         * audio_frames worth of samples have been generated — drain
+         * those into the host PCM ring and keep going. Without this
+         * loop the PPU would stall on a full audio buffer and the
+         * blit below would paint the previous frame, halving the
+         * effective frame rate. */
+        Ticks target = emulator_get_ticks(emu) + PPU_FRAME_TICKS;
+        EmulatorEvent ev = 0;
+        for (int safety = 0; safety < 16; safety++) {
+            ev = emulator_run_until(emu, target);
+            if (have_audio && (ev & EMULATOR_EVENT_AUDIO_BUFFER_FULL)) {
+                push_audio(emulator_get_audio_buffer(emu));
+            }
+            if (ev & EMULATOR_EVENT_NEW_FRAME) break;
+            if (ev == 0) break;          /* hit target_ticks without frame */
+        }
 
-        if (have_gfx) {
+        if (have_gfx && (ev & EMULATOR_EVENT_NEW_FRAME)) {
             FrameBuffer *fb = emulator_get_frame_buffer(emu);
             blit_frame((const RGBA *)*fb, x_off, y_off);
         }
 
-        if (have_audio) {
-            push_audio(emulator_get_audio_buffer(emu));
-        }
+        /* Drain whatever audio binjgb has accumulated since the last
+         * AUDIO_BUFFER_FULL drain. Catches the trailing partial buffer
+         * for the frame's tail. */
+        if (have_audio) push_audio(emulator_get_audio_buffer(emu));
 
         time_busy_until(deadline);
         deadline += ticks_per_frame;
