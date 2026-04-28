@@ -1,0 +1,3 @@
+[submodule "vendor/rvvm-hal"]
+	path = vendor/rvvm-hal
+	url = https://github.com/SolAstrius/rvvm-hal.git

@@ -1,0 +1,9 @@
+.direnv/
+build/
+firmware.bin
+firmware.elf
+result
+*.o
+roms/*.gb
+roms/*.gbc
+roms/*.sav
