@@ -65,13 +65,31 @@ firmware.bin: firmware.elf
 
 ROM ?= roms/test.gb
 
+# Convenience: if SAVE=… is set and the file is missing, pre-create
+# a 128 KB zero-filled file (covers any MBC's ext-RAM size). Then
+# attach it as NVMe disk 1; the firmware reads it at boot, calls
+# emulator_read_ext_ram, and writes back every 5 seconds.
+#
+# Without SAVE=, no -nvme disk 1 is attached and ext-RAM lives only
+# in the Emulator struct's BSS — saves work in-session but vanish
+# on RVVM exit.
+define ENSURE_SAVE
+	@if [ -n "$(SAVE)" ] && [ ! -f "$(SAVE)" ]; then \
+	    mkdir -p $$(dirname "$(SAVE)"); \
+	    dd if=/dev/zero of="$(SAVE)" bs=1024 count=128 status=none; \
+	    echo "save: created empty $(SAVE) (128 KB)"; \
+	fi
+endef
+
 run: firmware.bin
 	@test -f "$(ROM)" || { echo "missing $(ROM); set ROM=path/to/cart.gb"; exit 1; }
-	$(RVVM) firmware.bin -bochs_display -nonet -hda_test -nvme $(ROM)
+	$(ENSURE_SAVE)
+	$(RVVM) firmware.bin -bochs_display -nonet -hda_test -nvme $(ROM) $(if $(SAVE),-nvme $(SAVE))
 
 run-headless: firmware.bin
 	@test -f "$(ROM)" || { echo "missing $(ROM); set ROM=path/to/cart.gb"; exit 1; }
-	$(RVVM) firmware.bin -nogui -nonet -hda_test -nvme $(ROM)
+	$(ENSURE_SAVE)
+	$(RVVM) firmware.bin -nogui -nonet -hda_test -nvme $(ROM) $(if $(SAVE),-nvme $(SAVE))
 
 clean:
 	rm -rf build firmware.elf firmware.bin

@@ -66,6 +66,21 @@ static int16_t pcm_ring[PCM_RING_FRAMES * 2];   /* stereo */
 __attribute__((aligned(NVME_PAGE_SIZE)))
 static uint8_t  cart_rom[MAXIMUM_ROM_SIZE];
 
+/* Save (ext-RAM) staging buffer. 128 KB covers MBC5 max. Page-aligned
+ * for NVMe DMA. The same buffer is used for both the boot-time read
+ * and periodic write-back. */
+#define SAVE_BUF_BYTES   (128u * 1024u)
+#define SAVE_PERIOD_PPU  300u    /* ~5 s at 59.7 Hz */
+
+__attribute__((aligned(NVME_PAGE_SIZE)))
+static uint8_t  save_buf[SAVE_BUF_BYTES];
+
+static nvme_t   save_disk;
+static bool     save_attached    = false;
+static uint32_t save_size_bytes  = 0;
+static uint32_t save_size_lbas   = 0;
+static uint32_t last_save_ppu_frame = 0;
+
 static gfx_t          g;
 static hid_keyboard_t kb;
 static audio_pcm_t    pcm;
@@ -100,6 +115,87 @@ static uintptr_t fdt_addr_of(const fdt_t *fdt, const char *compat,
     uint64_t addr = 0;
     if (!fdt_node_reg64(fdt, off, 0, &addr, NULL)) return fallback;
     return (uintptr_t)addr;
+}
+
+/* Cart-header ext-RAM size — byte $149. binjgb has its own internal
+ * decode but doesn't expose it cleanly; this is small enough to
+ * mirror. Returns 0 if cart has no battery-backed RAM. */
+static uint32_t cart_ext_ram_size(const uint8_t *rom) {
+    switch (rom[0x149]) {
+        case 0x00: return 0;
+        case 0x01: return  2u * 1024u;
+        case 0x02: return  8u * 1024u;
+        case 0x03: return 32u * 1024u;
+        case 0x04: return 128u * 1024u;
+        case 0x05: return 64u * 1024u;
+        default:   return 0;
+    }
+}
+
+/* Try to attach NVMe controller 1 as the save disk, populate ext-RAM
+ * from its contents, and arm periodic write-back. Silent no-op if no
+ * disk 1 is attached or the cart has no ext-RAM. The save file should
+ * be at least the cart's ext-RAM size — Makefile pre-creates a 128 KB
+ * zero-filled file when SAVE= is set, which covers any MBC. */
+static void init_save(Emulator *e, const uint8_t *rom) {
+    save_size_bytes = cart_ext_ram_size(rom);
+    if (save_size_bytes == 0) {
+        uart_puts("save: cart has no ext-RAM (no battery)\n");
+        return;
+    }
+    if (save_size_bytes > SAVE_BUF_BYTES) {
+        uart_printf("save: cart wants %u bytes ext-RAM, buf is %u; skipping\n",
+                    (uint64_t)save_size_bytes, (uint64_t)SAVE_BUF_BYTES);
+        return;
+    }
+    if (!nvme_init_nth(&save_disk, 1)) {
+        uart_puts("save: no NVMe disk 1 attached "
+                  "(saves won't persist; pass SAVE=… to make run)\n");
+        return;
+    }
+
+    save_size_lbas = (save_size_bytes + NVME_LBA_SIZE - 1) / NVME_LBA_SIZE;
+    if (save_size_lbas > save_disk.num_lbas) {
+        uart_printf("save: disk too small (have %u LBAs, need %u); skipping\n",
+                    (uint64_t)save_disk.num_lbas, (uint64_t)save_size_lbas);
+        return;
+    }
+
+    /* Read existing save bytes. NVMe rounds up to LBA granularity;
+     * the trailing slack inside the last sector is harmless because
+     * binjgb only consumes save_size_bytes. */
+    uint32_t got = nvme_read(&save_disk, 0, save_buf, save_size_lbas);
+    if (got != save_size_lbas) {
+        uart_printf("save: read short (%u/%u LBAs); starting fresh\n",
+                    (uint64_t)got, (uint64_t)save_size_lbas);
+        for (uint32_t i = 0; i < save_size_bytes; i++) save_buf[i] = 0;
+    }
+
+    FileData fd = { .data = save_buf, .size = save_size_bytes };
+    if (emulator_read_ext_ram(e, &fd) != OK) {
+        uart_puts("save: emulator_read_ext_ram failed; skipping\n");
+        return;
+    }
+
+    save_attached = true;
+    uart_printf("save: %u bytes loaded from NVMe disk 1 "
+                "(autosave every %u s)\n",
+                (uint64_t)save_size_bytes,
+                (uint64_t)(SAVE_PERIOD_PPU / 60));
+}
+
+/* Periodic write-back. Called every emulator frame; only does work
+ * once per SAVE_PERIOD_PPU PPU frames. Cheap when it doesn't fire,
+ * and the actual write is one ~17 KB NVMe op for an 8 KB cart, ~256
+ * KB for a 128 KB cart — both well under one frame's slack. */
+static void tick_save(Emulator *e, uint32_t ppu_frame_count) {
+    if (!save_attached) return;
+    if (ppu_frame_count - last_save_ppu_frame < SAVE_PERIOD_PPU) return;
+
+    FileData fd = { .data = save_buf, .size = save_size_bytes };
+    if (emulator_write_ext_ram(e, &fd) != OK) return;
+    nvme_write(&save_disk, 0, save_buf, save_size_lbas);
+    last_save_ppu_frame = ppu_frame_count;
 }
 
 /* Read up to MAXIMUM_ROM_SIZE bytes from NVMe controller 0 into
@@ -288,6 +384,10 @@ void kmain(uint64_t hartid, uint64_t fdt_addr) {
                 (uint64_t)(binjgb_shim_used_bytes() >> 10),
                 (uint64_t)(binjgb_shim_pool_bytes() >> 10));
 
+    /* Save layer — load any existing ext-RAM contents from NVMe
+     * disk 1; arm periodic write-back if attached. */
+    init_save(emu, cart_rom);
+
     AudioBuffer *ab = emulator_get_audio_buffer(emu);
     uart_printf("audio buffer: %u Hz, %u frames/run\n",
                 (uint64_t)ab->frequency, (uint64_t)ab->frames);
@@ -362,6 +462,10 @@ void kmain(uint64_t hartid, uint64_t fdt_addr) {
             FrameBuffer *fb = emulator_get_frame_buffer(emu);
             blit_frame((const RGBA *)*fb, x_off, y_off);
         }
+
+        /* Periodic ext-RAM write-back to NVMe disk 1. Cheap when not
+         * firing, ~256 KB write at most when it does. */
+        tick_save(emu, emulator_get_ppu_frame(emu));
         uint64_t t3 = time_now();
         prof_blit += t3 - t2;
 
