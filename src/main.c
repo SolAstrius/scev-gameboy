@@ -138,12 +138,18 @@ static uint32_t load_cart_from_nvme(void) {
 /* Direct-to-vram blit, ×4 nearest-neighbour. Bypasses gfx_pixel's
  * per-call format check by hoisting it once at the top, hoists the
  * 4 destination row pointers once per source scanline, and unrolls
- * the 4×4 source-pixel block into 16 explicit stores. ~4× faster
- * than the per-call helper for our visible 92,160-pixel surface. */
+ * the 4×4 source-pixel block into 16 explicit stores.
+ *
+ * Pixel format note: binjgb's RGBA packs as 0xAABBGGRR — R in the
+ * low byte. Bochs Display's XRGB8888 wants R in the HIGH byte
+ * (0x00RRGGBB). So we must swap R↔B when the surface is XRGB; when
+ * the surface is XBGR (simplefb sometimes), binjgb's bytes already
+ * line up and no swap is needed. (My previous version had this
+ * conditional inverted, producing the famous "blue Zelda" bug.) */
 static void blit_frame(const RGBA *fb, uint32_t x_off, uint32_t y_off) {
     uint32_t *vram   = g.vram;
     uint32_t  stride = g.stride_px;
-    bool      bgr    = (g.format == GFX_FMT_XBGR8888);
+    bool      need_swap = (g.format == GFX_FMT_XRGB8888);
 
     for (uint32_t y = 0; y < GB_H; y++) {
         uint32_t  base = (y_off + y * GB_SCALE) * stride + x_off;
@@ -155,10 +161,10 @@ static void blit_frame(const RGBA *fb, uint32_t x_off, uint32_t y_off) {
 
         for (uint32_t x = 0; x < GB_W; x++) {
             uint32_t c = (uint32_t)src[x] & 0x00FFFFFFu;
-            if (bgr) {
-                uint32_t r = (c >> 16) & 0xFF;
-                uint32_t b = (c >>  0) & 0xFF;
-                c = (c & 0xFF00FF00U) | (b << 16) | r;
+            if (need_swap) {
+                uint32_t r = c        & 0xFF;
+                uint32_t b = (c >> 16) & 0xFF;
+                c = (c & 0x0000FF00U) | (r << 16) | b;
             }
             uint32_t dx = x * GB_SCALE;
             r0[dx] = r0[dx+1] = r0[dx+2] = r0[dx+3] = c;
@@ -268,7 +274,10 @@ void kmain(uint64_t hartid, uint64_t fdt_addr) {
     init.random_seed     = (uint32_t)time_now();
     init.builtin_palette = 0;             /* default greys for DMG */
     init.force_dmg       = 0;
-    init.cgb_color_curve = 0;             /* CGB_COLOR_CURVE_NONE */
+    init.cgb_color_curve = CGB_COLOR_CURVE_SAMEBOY_EMULATE_HARDWARE;
+    /* SameBoy's curve models the actual GBC LCD's response: warmer
+     * mids, slightly desaturated reds. Cleaner than NONE (raw 5-bit
+     * cart RGB) and matches what most modern GBC emulators ship. */
 
     emu = emulator_new(&init);
     if (!emu) {
