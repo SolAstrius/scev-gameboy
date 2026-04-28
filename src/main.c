@@ -307,9 +307,13 @@ void kmain(uint64_t hartid, uint64_t fdt_addr) {
      * path needs work. */
     uint64_t prof_run = 0, prof_blit = 0, prof_audio = 0,
              prof_hid = 0, prof_pace = 0;
-    uint32_t prof_frames = 0, prof_run_calls = 0,
+    uint32_t prof_iters = 0, prof_run_calls = 0,
              prof_audio_drops = 0;
-    uint64_t prof_window_start = time_now();
+    /* binjgb's authoritative "PPU frames produced" counter — the
+     * one that tells us emulator-speed-vs-wall-clock honestly,
+     * regardless of whether our loop ever called blit. */
+    uint32_t prof_ppu_frame_base = emulator_get_ppu_frame(emu);
+    uint64_t prof_window_start   = time_now();
 
     for (;;) {
         uint64_t t0 = time_now();
@@ -318,13 +322,17 @@ void kmain(uint64_t hartid, uint64_t fdt_addr) {
         uint64_t t1 = time_now();
         prof_hid += t1 - t0;
 
-        /* Drive the emulator until the PPU finishes a frame. binjgb
-         * may return EMULATOR_EVENT_AUDIO_BUFFER_FULL mid-frame when
-         * audio_frames worth of samples have been generated — drain
-         * those into the host PCM ring and keep going. */
-        Ticks target = emulator_get_ticks(emu) + PPU_FRAME_TICKS;
-        EmulatorEvent ev = 0;
-        for (int safety = 0; safety < 16; safety++) {
+        /* Drive the emulator forward by exactly one PPU frame's
+         * worth of ticks. Each call to run_until may return early on
+         * AUDIO_BUFFER_FULL (drain) or UNTIL_TICKS (deadline reached);
+         * we re-target each call from the CURRENT tick counter so
+         * we always make forward progress, even when LCD is off and
+         * NEW_FRAME never fires. Loop terminates when TICKS has
+         * advanced by PPU_FRAME_TICKS. */
+        Ticks initial_ticks = emulator_get_ticks(emu);
+        Ticks target        = initial_ticks + PPU_FRAME_TICKS;
+        EmulatorEvent ev    = 0;
+        while (emulator_get_ticks(emu) < target) {
             ev = emulator_run_until(emu, target);
             prof_run_calls++;
             if (have_audio && (ev & EMULATOR_EVENT_AUDIO_BUFFER_FULL)) {
@@ -332,8 +340,6 @@ void kmain(uint64_t hartid, uint64_t fdt_addr) {
                 push_audio(emulator_get_audio_buffer(emu));
                 prof_audio += time_now() - a0;
             }
-            if (ev & EMULATOR_EVENT_NEW_FRAME) break;
-            if (ev == 0) break;
         }
         uint64_t t2 = time_now();
         prof_run += t2 - t1;
@@ -360,27 +366,36 @@ void kmain(uint64_t hartid, uint64_t fdt_addr) {
         prof_pace += t5 - t4;
         deadline += ticks_per_frame;
 
-        if (++prof_frames >= 60) {
-            uint64_t window = t5 - prof_window_start;
-            /* Convert ticks → microseconds (10 MHz → ÷10). All
-             * formats use uart_printf's %u (uint64_t), so we cast. */
+        if (++prof_iters >= 60) {
+            uint64_t window  = t5 - prof_window_start;
+            uint32_t ppu_now = emulator_get_ppu_frame(emu);
+            uint32_t ppu_dt  = ppu_now - prof_ppu_frame_base;
+            /* Effective emulator speed: PPU frames produced × 1000 /
+             * window_ms = real Hz the GB hardware is running at.
+             * 59.7 = native; <30 = visibly slow. */
+            uint64_t eff_hz_x10 = (uint64_t)ppu_dt * 10000ULL
+                                / ((uint64_t)window / 10000ULL);
             #define US(t) ((uint64_t)((t) / 10))
-            uart_printf("[prof] %u frames in %u ms — "
+            uart_printf("[prof] iters=%u ppu_frames=%u "
+                        "wall=%ums eff=%u.%uHz | "
                         "run=%uus blit=%uus audio=%uus hid=%uus pace=%uus "
-                        "(run-calls=%u, audio-drops=%u)\n",
-                        (uint64_t)prof_frames,
+                        "(run-calls=%u, drops=%u)\n",
+                        (uint64_t)prof_iters,
+                        (uint64_t)ppu_dt,
                         US(window) / 1000,
-                        US(prof_run)   / prof_frames,
-                        US(prof_blit)  / prof_frames,
-                        US(prof_audio) / prof_frames,
-                        US(prof_hid)   / prof_frames,
-                        US(prof_pace)  / prof_frames,
+                        eff_hz_x10 / 10, eff_hz_x10 % 10,
+                        US(prof_run)   / prof_iters,
+                        US(prof_blit)  / prof_iters,
+                        US(prof_audio) / prof_iters,
+                        US(prof_hid)   / prof_iters,
+                        US(prof_pace)  / prof_iters,
                         (uint64_t)prof_run_calls,
                         (uint64_t)prof_audio_drops);
             #undef US
             prof_run = prof_blit = prof_audio = prof_hid = prof_pace = 0;
-            prof_frames = prof_run_calls = prof_audio_drops = 0;
-            prof_window_start = t5;
+            prof_iters = prof_run_calls = prof_audio_drops = 0;
+            prof_ppu_frame_base = ppu_now;
+            prof_window_start   = t5;
         }
     }
 }
