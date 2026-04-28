@@ -53,13 +53,20 @@ void *memcpy(void *, const void *, unsigned long);
  * binjgb's native sample rate (44100) so we don't pitch-shift +9 %
  * by replaying 44.1 kHz samples through a 48 kHz PCM channel. RVVM's
  * HDA accepts 44100 directly. 4410 frames = 100 ms ring at 44.1 kHz;
- * round to a multiple of 5 (the BDL entry count) → 4400. */
+ * round to a multiple of 5 (the BDL entry count) → 4400.
+ *
+ * Stereo: PCM_CHANNELS=2, ring sized as int16[ring_frames * channels]
+ * with interleaved L,R per frame. RVVM currently averages L+R into
+ * mono inside its HDA stream worker (sound-hda.c) before ALSA — so
+ * the audible output is mono today, but this code path is correct
+ * for the eventual stereo widget. */
 #define PCM_RING_FRAMES   4400u
 #define PCM_BDL_ENTRIES   5u
 #define PCM_SAMPLE_RATE   44100u
+#define PCM_CHANNELS      2u
 
 __attribute__((aligned(128)))
-static int16_t pcm_ring[PCM_RING_FRAMES * 2];   /* stereo */
+static int16_t pcm_ring[PCM_RING_FRAMES * PCM_CHANNELS];
 
 /* Static cart ROM staging buffer. 8 MB max (MBC5 limit). NVMe DMA
  * needs page alignment. */
@@ -284,18 +291,29 @@ static void push_audio(AudioBuffer *ab) {
     ab->position = ab->data;
     if (frames == 0) return;
 
+    /* Wait briefly for ring room when the host is transiently behind,
+     * rather than dropping the batch. Dropping leaves the ring slots
+     * holding stale audio from a previous wrap — when LPIB later
+     * sweeps through them, the host replays that stale snippet, audible
+     * as a click. Linux's ALSA writei is blocking on the guest side and
+     * dodges this by stalling the producer; we mirror that here.
+     *
+     * 1 ms polling chunks for up to 5 ms (well under one PPU frame =
+     * 16.7 ms, so even the worst-case wait keeps us inside the frame's
+     * pacing budget). If the host is genuinely stalled longer than
+     * that — PipeWire stuck, ALSA wedged — give up and drop; emulator
+     * pacing matters more than fidelity at that point. */
     uint32_t writable = audio_pcm_writable(&pcm);
-    if (writable < frames) {
-        /* Host hasn't drained fast enough — drop this batch. Audio
-         * glitches but emulation stays paced. Common when the GB
-         * frame rate (59.7 Hz) is faster than wall-clock pacing
-         * during JIT warmup. */
-        return;
+    int      waited   = 0;
+    while (writable < frames) {
+        if (waited++ >= 5) return;
+        time_busy_until(time_now() + RVVM_TIME_HZ / 1000);
+        writable = audio_pcm_writable(&pcm);
     }
 
     uint32_t wp = pcm.wp_frames;
     for (uint32_t i = 0; i < frames; i++) {
-        uint32_t idx = ((wp + i) % PCM_RING_FRAMES) * 2;
+        uint32_t idx = ((wp + i) % PCM_RING_FRAMES) * PCM_CHANNELS;
         int16_t l = (int16_t)(((int32_t)ab->data[i * 2 + 0] - 128) << 8);
         int16_t r = (int16_t)(((int32_t)ab->data[i * 2 + 1] - 128) << 8);
         pcm_ring[idx + 0] = l;
@@ -340,9 +358,10 @@ void kmain(uint64_t hartid, uint64_t fdt_addr) {
     /* Audio. */
     bool have_audio = audio_init();
     if (have_audio) {
-        for (uint32_t i = 0; i < PCM_RING_FRAMES * 2; i++) pcm_ring[i] = 0;
+        for (uint32_t i = 0; i < PCM_RING_FRAMES * PCM_CHANNELS; i++) pcm_ring[i] = 0;
         if (!audio_pcm_open(&pcm, pcm_ring, PCM_RING_FRAMES,
-                            PCM_BDL_ENTRIES, PCM_SAMPLE_RATE)) {
+                            PCM_BDL_ENTRIES, PCM_SAMPLE_RATE,
+                            PCM_CHANNELS)) {
             uart_puts("audio_pcm_open failed; continuing silently\n");
             have_audio = false;
         }
