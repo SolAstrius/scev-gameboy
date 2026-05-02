@@ -423,8 +423,19 @@ void kmain(uint64_t hartid, uint64_t fdt_addr) {
 
     /* Graphics. 160×144 ×4 → 640×576. */
     bool have_gfx = gfx_init_fdt(&g, &fdt, DISPLAY_W, DISPLAY_H);
+    bool db_gfx   = false;
     if (have_gfx) {
         gfx_fill(&g, 0x00000000);
+        /* Page-flipped double buffer (Bochs only): the host display
+         * never reads a half-blitted frame. Both halves cleared so the
+         * area outside 160×144×4 stays black across flips. */
+        if (gfx_enable_double_buffer(&g)) {
+            db_gfx = true;
+            gfx_fill(&g, 0x00000000);   /* fills back */
+            gfx_flip(&g);
+            gfx_fill(&g, 0x00000000);   /* fills new back */
+        }
+        if (db_gfx) uart_puts("gfx: double-buffered\n");
     } else {
         uart_puts("gfx: no display backend; running blind\n");
     }
@@ -554,6 +565,7 @@ void kmain(uint64_t hartid, uint64_t fdt_addr) {
         if (have_gfx && (ev & EMULATOR_EVENT_NEW_FRAME)) {
             FrameBuffer *fb = emulator_get_frame_buffer(emu);
             blit_frame((const RGBA *)*fb, x_off, y_off);
+            if (db_gfx) gfx_flip(&g);
         }
 
         /* Periodic ext-RAM write-back to NVMe disk 1. Cheap when not
